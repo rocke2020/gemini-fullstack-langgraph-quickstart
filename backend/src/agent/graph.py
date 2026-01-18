@@ -1,43 +1,51 @@
 import os
 
-from agent.tools_and_schemas import SearchQueryList, Reflection
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
-from langgraph.types import Send
-from langgraph.graph import StateGraph
-from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 
-from agent.state import (
+from src.agent.configuration import Configuration
+from src.agent.init_models import get_model_client
+from src.agent.prompts import (
+    answer_instructions,
+    get_current_date,
+    query_writer_instructions,
+    reflection_instructions,
+    web_searcher_instructions,
+)
+from src.agent.state import (
     OverallState,
     QueryGenerationState,
     ReflectionState,
     WebSearchState,
 )
-from agent.configuration import Configuration
-from agent.prompts import (
-    get_current_date,
-    query_writer_instructions,
-    web_searcher_instructions,
-    reflection_instructions,
-    answer_instructions,
-)
-from langchain_google_genai import ChatGoogleGenerativeAI
-from agent.utils import (
+from src.agent.tools_and_schemas import Reflection, SearchQueryList
+from src.agent.utils import (
     get_citations,
     get_research_topic,
     insert_citation_markers,
     resolve_urls,
 )
+from src.agent.web_fetcher import batch_web_contents_fetch, web_url_search
 
 load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
+MAX_SUBQUERIES_NUM = 5
+MAX_SEARCH_NUM = 5
+MAX_TITLE_LENGTH = 120
+MAX_CONTENT_CHARS = 10_000
 
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+def get_llm(temperature: float = 0.2, api_type="tongyi"):
+    """Initialize and return a model client based on the specified API type and temperature.
+
+    Args:
+        temperature (float): The temperature setting for the model.
+        api_type (str): The type of API to use ("tongyi" or "deepseek").
+    """
+    return get_model_client(temperature=temperature, api_type=api_type)
 
 
 # Nodes
@@ -61,12 +69,7 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
     # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
+    llm = get_llm(temperature=0.7, api_type="tongyi")
     structured_llm = llm.with_structured_output(SearchQueryList)
 
     # Format the prompt
@@ -91,8 +94,9 @@ def continue_to_web_research(state: QueryGenerationState):
         for idx, search_query in enumerate(state["search_query"])
     ]
 
-
-def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
+def web_research_google_client(
+    state: WebSearchState, config: RunnableConfig
+) -> OverallState:
     """LangGraph node that performs web research using the native Google Search API tool.
 
     Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
@@ -104,6 +108,8 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     Returns:
         Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
     """
+    from google.genai import Client
+
     # Configure
     configurable = Configuration.from_runnable_config(config)
     formatted_prompt = web_searcher_instructions.format(
@@ -112,6 +118,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     )
 
     # Uses the google genai client as the langchain client doesn't return grounding metadata
+    genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
     response = genai_client.models.generate_content(
         model=configurable.query_generator_model,
         contents=formatted_prompt,
@@ -134,6 +141,34 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
         "search_query": [state["search_query"]],
         "web_research_result": [modified_text],
     }
+
+def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
+    """LangGraph node that performs web research using the native Google Search API tool.
+
+    Executes a web search using the TavilyClient Search API tool.
+
+    Args:
+        state: Current graph state containing the search query and research loop count
+        config: Configuration for the runnable, including search API settings
+
+    Returns:
+        Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
+    """
+    query = state["search_query"]
+    urls = web_url_search(query, k=MAX_SEARCH_NUM)
+    if not urls or urls[0]["url"] == "":
+        return {
+            "sources_gathered": [],
+            "search_query": [query],
+            "web_research_result": ["No search results found."],
+        }
+    sources_gathered = [hit["url"] for hit in urls if hit["url"] != ""]
+    web_contents = batch_web_contents_fetch(
+        sources_gathered,
+        max_chars=MAX_CONTENT_CHARS,
+    )
+    
+    
 
 
 def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
