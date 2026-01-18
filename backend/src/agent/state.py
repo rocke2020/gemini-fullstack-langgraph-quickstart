@@ -45,4 +45,4 @@ class WebSearchState(TypedDict):
 
 @dataclass(kw_only=True)
 class SearchStateOutput:
-    running_summary: str = field(default=None)  # Final report
+    running_summary: str | None = field(default=None)  # Final report

@@ -266,7 +266,7 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
 
 
 # Create our Agent Graph
-builder = StateGraph(OverallState, config_schema=Configuration)
+builder = StateGraph(OverallState)
 
 # Define the nodes we will cycle between
 builder.add_node("generate_query", generate_query)
