@@ -23,6 +23,23 @@ def get_model_client(
     timeout=None,
     max_retries=2,
 ):
+    """Get a model client based on the API type.
+
+    Args:
+        model_name: The name of the model to use.
+        api_type: The type of API ("tongyi" or "deepseek").
+        temperature: The temperature for the model.
+        max_tokens: The maximum number of tokens to generate.
+        timeout: The timeout for the model.
+        max_retries: The maximum number of retries for the model.
+
+    model_name:
+        tongyi:
+            free 90days:  glm-4.7：200k, deepseek-v3.2: 128k, qwen3-vl-plus-2025-12-19 qwen-plus-2025-12-01
+            paid model: qwen3-plus
+        deepseek:
+            deepseek-chat
+    """
     if api_type == "tongyi":
         return ChatTongyi(
             model=model_name,
@@ -53,15 +70,6 @@ deepseek_model = ChatDeepSeek(
     max_retries=2,
     timeout=None,
     # other params...
-)
-
-# free 90days:  glm-4.7：200k, deepseek-v3.2: 128k, qwen3-vl-plus-2025-12-19 qwen-plus-2025-12-01
-# paid model: qwen3-plus
-tongyi_chat_model = ChatTongyi(
-    model="glm-4.7",
-    api_key=SecretStr(DASHSCOPE_API_KEY),
-    max_retries=2,
-    model_kwargs={"temperature": 0.7},
 )
 tongyi_vl_plus_model = ChatTongyi(
     model="qwen3-vl-plus-2025-12-19",
@@ -122,9 +130,21 @@ def test_openai_client_tongyi(model_name="qwen3-vl-plus-2025-12-19"):
 
 
 if __name__ == "__main__":
+    from pydantic import BaseModel, Field
+
+    class SearchQueryList(BaseModel):
+        query: list[str] = Field(
+            description="A list of search queries to be used for web research."
+        )
+        rationale: str = Field(
+            description="A brief explanation of why these queries are relevant to the research topic."
+        )
+
     RUN_DEEPSEEK = 0
     RUN_QW_CHAT = 0
     RUN_QW_OPENAI = 0
+    TEST_STRUCTURED_OUTPUT = 1
+
     if RUN_DEEPSEEK:
         ai_msg = deepseek_model.invoke(messages_raw)
         """ The returned ai_msg is of type HumanMessage
@@ -141,10 +161,37 @@ ai_msg = AIMessage(
         print(f"deepseek: {ai_msg = }")
 
     if RUN_QW_CHAT:
-        ai_msg = tongyi_chat_model.invoke(messages_raw)
+        ai_msg = get_model_client(temperature=0.7, api_type="tongyi").invoke(
+            messages_raw
+        )
         print(f"tongyi: {ai_msg = }")
         # ai_msg = tongyi_chat_model.invoke(messages_raw)
         # print(f"tongyi: {ai_msg = }")
 
     if RUN_QW_OPENAI:
         test_openai_client_tongyi()
+
+    if TEST_STRUCTURED_OUTPUT:
+        query = """\
+Your goal is to generate sophisticated and diverse web search queries. These queries are intended for an advanced automated web research tool capable of analyzing complex results, following links, and synthesizing information.
+Instructions:
+- Always prefer a single search query, only add another query if the original question requests multiple aspects or elements and one query is not enough.
+- Each query should focus on one specific aspect of the original question.
+- Don't produce more than 3 queries.
+- Queries should be diverse, if the topic is broad, generate more than 1 query.
+- Don't generate multiple similar queries, 1 is enough.
+- Query should ensure that the most current information is gathered. The current date is January 19, 2026.
+
+Format:
+- Format your response as a JSON object with ALL two of these exact keys:
+   - "rationale": Brief explanation of why these queries are relevant
+   - "query": A list of search queries
+
+Context: 分析2026年的金融研投行业的AI agent发展趋势
+"""
+        # query = '分析2026年的金融研投行业的AI agent发展趋势'
+        structured_llm = get_model_client(
+            temperature=0.5, api_type="deepseek", model_name="deepseek-chat"
+        ).with_structured_output(SearchQueryList)
+        result = structured_llm.invoke(query)
+        print(f"structured output: {result = }, {result.query = }")

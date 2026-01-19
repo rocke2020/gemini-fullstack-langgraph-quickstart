@@ -32,13 +32,13 @@ from src.agent.web_fetcher import batch_web_contents_fetch, web_url_search
 
 load_dotenv()
 
-MAX_SUBQUERIES_NUM = 5
-MAX_SEARCH_NUM = 5
+MAX_SUBQUERIES_NUM = 3
+MAX_SEARCH_NUM = 3
 MAX_TITLE_LENGTH = 120
 MAX_CONTENT_CHARS = 10_000
 
 
-def get_llm(temperature: float = 0.2, api_type="tongyi"):
+def get_llm(temperature: float = 0.2, api_type="deepseek"):
     """Initialize and return a model client based on the specified API type and temperature.
 
     Args:
@@ -68,8 +68,7 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = get_llm(temperature=0.7, api_type="tongyi")
+    llm = get_llm(temperature=0.7)
     structured_llm = llm.with_structured_output(SearchQueryList)
 
     # Format the prompt
@@ -80,6 +79,7 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         number_queries=state["initial_search_query_count"],
     )
     # Generate the search queries
+    print(f'{formatted_prompt = }')
     result = structured_llm.invoke(formatted_prompt)
     return {"search_query": result.query}
 
@@ -93,6 +93,7 @@ def continue_to_web_research(state: QueryGenerationState):
         Send("web_research", {"search_query": search_query, "id": int(idx)})
         for idx, search_query in enumerate(state["search_query"])
     ]
+
 
 def web_research_google_client(
     state: WebSearchState, config: RunnableConfig
@@ -142,6 +143,7 @@ def web_research_google_client(
         "web_research_result": [modified_text],
     }
 
+
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     """LangGraph node that performs web research using the native Google Search API tool.
 
@@ -162,13 +164,29 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
             "search_query": [query],
             "web_research_result": ["No search results found."],
         }
-    sources_gathered = [hit["url"] for hit in urls if hit["url"] != ""]
+    valid_urls = [hit["url"] for hit in urls if hit["url"] != ""]
     web_contents = batch_web_contents_fetch(
-        sources_gathered,
+        valid_urls,
         max_chars=MAX_CONTENT_CHARS,
     )
-    
-    
+    research_contents = []
+    for url, web_content in zip(valid_urls, web_contents):
+        if web_content is None:
+            title = "N/A"
+            content = "Failed to fetch content."
+        else:
+            title = web_content["title"][:MAX_TITLE_LENGTH]
+            content = web_content["content"]
+        research_contents.append(f"URL: {url}\nTitle: {title}\nContent: {content}")
+    return {
+        "sources_gathered": [
+            {"value": hit["url"], "short_url": hit["url"]}
+            for hit in urls
+            if hit["url"] != ""
+        ],
+        "search_query": [query],
+        "web_research_result": research_contents,
+    }
 
 
 def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
@@ -198,12 +216,7 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
     # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
+    llm = get_llm(temperature=1)
     result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
 
     return {
@@ -240,6 +253,8 @@ def evaluate_research(
     if state["is_sufficient"] or state["research_loop_count"] >= max_research_loops:
         return "finalize_answer"
     else:
+        follow_up_queries = state["follow_up_queries"]
+        print(f'{len(follow_up_queries) = }, {follow_up_queries = }')
         return [
             Send(
                 "web_research",
@@ -248,7 +263,7 @@ def evaluate_research(
                     "id": state["number_of_ran_queries"] + int(idx),
                 },
             )
-            for idx, follow_up_query in enumerate(state["follow_up_queries"])
+            for idx, follow_up_query in enumerate(follow_up_queries)
         ]
 
 
@@ -265,10 +280,6 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
     Returns:
         Dictionary with state update, including running_summary key containing the formatted final summary with sources
     """
-    configurable = Configuration.from_runnable_config(config)
-    reasoning_model = state.get("reasoning_model") or configurable.answer_model
-
-    # Format the prompt
     current_date = get_current_date()
     formatted_prompt = answer_instructions.format(
         current_date=current_date,
@@ -276,13 +287,7 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
+    llm = get_llm(temperature=0.5)
     result = llm.invoke(formatted_prompt)
 
     # Replace the short urls with the original urls and add all used urls to the sources_gathered
